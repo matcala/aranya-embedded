@@ -1,234 +1,341 @@
-# Aranya vs Aranya Embedded: Capability Comparison
+# Aranya vs Aranya Embedded: Capability Comparison (Revised)
 
 ## Executive Summary
 
-Aranya Embedded is **not a production-ready replacement** for the full Aranya daemon in its current state. It is a **demonstration/proof-of-concept** adaptation targeting ESP32-S3 microcontrollers that preserves the core sync protocol and policy engine but **strips out all real cryptography, dynamic onboarding, and standard networking**. For a mixed Linux+MCU environment that requires authenticated/encrypted commands and the onboarding, sync, and ephemeral command features you currently rely on, the full version remains necessary — or Aranya Embedded would require substantial development to close the gaps.
-
-The sections below provide a detailed feature-by-feature comparison.
+With relaxed requirements (manual onboarding acceptable, no ephemeral commands needed, transport-agnostic sync desired), the gap between Aranya and Aranya Embedded narrows significantly. **Two real blockers remain**: (1) the cryptographic envelope and (2) interoperability between the two versions. The embedded version's `NetworkInterface` trait is actually **better positioned** for transport-agnostic sync than the full version's hardcoded QUIC transport. The policy VM is identical in both. This revised analysis focuses on the minimal gap and what it would take to close it.
 
 ---
 
-## 1. Architecture Overview
+## 1. Revised Requirements & What's No Longer Blocking
 
-| Aspect | Aranya (Full) | Aranya Embedded |
-|--------|---------------|-----------------|
-| **Deployment model** | Client-daemon (separate processes) | Single monolithic binary |
-| **Runtime** | Tokio async (multi-threaded) | Embassy async (single/dual-core MCU) |
-| **Language** | Rust (std) | Rust (no_std + alloc) |
-| **Target platforms** | Linux, macOS (POSIX required) | ESP32-S3 only |
-| **Version** | 3.0.0 | Pre-release / demo |
-| **License** | AGPL-3.0 | AGPL |
-| **Crate count** | 7 core + external deps | 11 crates (demo-focused) |
-
-### Architectural Implications for Replacement
-
-The full version uses a **client-daemon architecture** where the daemon is a long-running process managing graph state, sync, and crypto, and clients connect via Unix domain sockets with encrypted IPC (tarpc + MessagePack). This cleanly separates application logic from Aranya internals.
-
-Aranya Embedded collapses everything into a **single binary** with direct function calls. There is no IPC layer, no daemon process, and no client library. Your application code calls `daemon.create_team()` and `imp.call_action(...)` directly. This simplifies deployment on MCUs but means there's no process isolation and no C API equivalent.
+| Original Concern | Status | Why |
+|-----------------|--------|-----|
+| Dynamic onboarding | **Relaxed** | Manual config at build/deploy time is acceptable. Embedded already supports this via `aranya-embedded-config`. |
+| Ephemeral commands | **Relaxed** | Graph-persisted commands only. Both versions support this. |
+| Transport flexibility | **Embedded is better** | Embedded has the `NetworkInterface` trait; full version has QUIC hardcoded. |
+| Real crypto (auth + encryption) | **Still required** | NullEnvelope is a blocker. |
+| Interoperability (full + embedded) | **Still required** | Version mismatch and message format differences exist. |
+| Direct data channels (AFC/AQC) | **Optional** | Not blocking. |
+| C API | **Optional** | Not blocking; alternative integration approaches exist. |
 
 ---
 
-## 2. Feature Comparison: What You Currently Use
+## 2. What Works Today (No Gap)
 
-### 2.1 Onboarding Process
+### 2.1 Policy Engine — Identical
 
-| Capability | Aranya (Full) | Aranya Embedded |
-|------------|---------------|-----------------|
-| Team creation | `create_team()` with crypto key bundle | `create_team()` with fixed nonce `[0u8; 16]` |
-| Member addition | `add_member()` with device public keys | **Not implemented** — peers manually configured via flash tool |
-| Role assignment | Owner/Admin/Operator/Member hierarchy | **No role management** — demo policy has no roles |
-| Peer discovery | Dynamic via sync protocol | **None** — static peer list burned to flash |
-| Certificate exchange | Cryptographic key negotiation | **None** — NullEnvelope, no key exchange |
-| Key bundle generation | `aranya-keygen` tool | Hardcoded `NULL_KEY` (32 zero bytes) |
+The policy VM (`aranya-policy-vm`) is the **same crate** in both versions. The DSL compiler (`aranya-policy-compiler`) is also identical. Your existing policies will compile and run on embedded without modification.
 
-**Gap Assessment: CRITICAL**
+| Aspect | Full | Embedded | Compatible? |
+|--------|------|----------|-------------|
+| Policy DSL | `aranya-policy-lang` | Same | Yes |
+| Policy compiler | `aranya-policy-compiler` | Same | Yes |
+| Policy VM | `aranya-policy-vm` | Same | Yes |
+| Fact storage | Supported | Supported | Yes |
+| Effect emission | `EffectHandler` (async) | `Sink` trait (sync) | API differs, semantics same |
+| Build-time compilation | Supported | Default approach | Yes |
 
-Your current onboarding workflow — adding members with key bundles, assigning roles, having policy enforce who can onboard whom — has **no equivalent in Aranya Embedded**. The embedded version requires each node to be manually configured with a static peer list using the `aranya-embedded-config` CLI tool, which writes addresses directly to flash. There is no dynamic member addition, no role hierarchy, and no cryptographic identity verification.
+The embedded version compiles policies at build time into rkyv-serialized binary blobs embedded in the firmware. This is actually a clean approach — no runtime parsing overhead, smaller binary, and the same policy bytecode executes on both platforms.
 
-### 2.2 State Sync Across Endpoints
+### 2.2 Core Sync Algorithm — Identical
 
-| Capability | Aranya (Full) | Aranya Embedded |
-|------------|---------------|-----------------|
-| Sync protocol | QUIC-based with PSK auth | Custom protocol over IR/ESP-NOW |
-| Transport encryption | TLS/PSK per team | **None** — plaintext broadcast |
-| Connection management | Connection pooling, auto-reconnect | Broadcast flood, no connections |
-| Sync trigger | Configurable interval + on-demand | 500ms periodic Hello broadcast |
-| Error correction | Standard QUIC reliability | RaptorQ fountain codes (lossy-tolerant) |
-| Message format | postcard binary over QUIC streams | postcard + RaptorQ chunks + CRC-16 |
-| Peer tracking | Shared connection map | PeerCache (which commands each peer has) |
-| Stall handling | QUIC timeout/retry | 8-second stall timeout, resets session |
-| Max message size | `MAX_SYNC_MESSAGE_SIZE` constant | Same constant (from aranya-runtime) |
+Both versions use `aranya-runtime`'s `SyncRequester`/`SyncResponder` and the same CRDT-based linear merge algorithm. The command DAG structure, merge logic, and `PeerCache` tracking are shared.
 
-**Gap Assessment: MODERATE-TO-HIGH**
+| Aspect | Full | Embedded | Compatible? |
+|--------|------|----------|-------------|
+| CRDT merge algorithm | `aranya-runtime` | Same crate | Yes |
+| `SyncRequester` | From runtime | Same type | Yes (if version-aligned) |
+| `SyncResponder` | From runtime | Same type | Yes (if version-aligned) |
+| `PeerCache` | Shared connection map | Per-peer BTreeMap | Functionally equivalent |
+| `LinearStorageProvider` | File-based I/O | Flash/SD I/O | Same provider, different backends |
 
-The core sync **algorithm** (CRDT-based linear merge) is preserved — both versions use `aranya-runtime`'s `SyncRequester`/`SyncResponder` and the same command DAG structure. However, the **transport layer is completely different**:
+### 2.3 Storage Layer — Well Abstracted
 
-- Full version: QUIC over TCP/IP with TLS/PSK encryption, connection pooling, and standard networking.
-- Embedded: Custom packet protocol over IR or ESP-NOW (broadcast only), with RaptorQ for loss tolerance but **zero encryption or authentication**.
+Both use `LinearStorageProvider` from `aranya-runtime` with platform-specific I/O backends. This is one of the most portable parts of the system.
 
-For your mixed environment with TCP/IP and serial/bus networks, neither the full version's QUIC-only transport nor the embedded version's IR/ESP-NOW transport may be ideal. The embedded version's `NetworkInterface` trait is at least abstractable to other transports, but no TCP/IP or serial implementations exist today.
+### 2.4 Manual Onboarding — Already Works in Embedded
 
-### 2.3 Ephemeral Commands & Policy Enforcement
-
-| Capability | Aranya (Full) | Aranya Embedded |
-|------------|---------------|-----------------|
-| Policy language | Full DSL with 23 effect types | Same DSL, but simplified policies |
-| Policy compilation | Build-time or runtime | **Build-time only** (rkyv serialized binary) |
-| Policy VM | `aranya-policy-vm` | Same `aranya-policy-vm` |
-| Ephemeral sessions | `session_new()` / `session_receive()` | **Not implemented** |
-| Command sealing | Real cryptographic signatures | `NullEnvelope` — SHA256 hash, signature = `b"LOL"` |
-| Command validation | Full crypto verification on open | **No validation** — open always succeeds |
-| Role-based enforcement | Owner > Admin > Operator > Member | **No roles in demo policy** |
-| Effect types | 23 types (admin, channel, query) | 2-3 types (demo: LedColorChanged; chat: MessageReceived, AmbientColorChanged) |
-| Fact storage | Full fact database | Basic facts (e.g., `CurrentColor[]`) |
-| Labels | Create, assign, revoke labels | **Not implemented** |
-| Channel creation | AFC + AQC channel policies | **Not implemented** |
-
-**Gap Assessment: CRITICAL (for ephemeral commands), MODERATE (for basic policy)**
-
-The **policy engine itself is the same** — `aranya-policy-vm` runs in both environments, and the DSL compiler is identical. The embedded version compiles policies at build time and embeds them as binary blobs, which is actually a reasonable approach for constrained devices.
-
-However, **ephemeral sessions are not implemented** in the embedded version. The `session_new()` / `session_receive()` API that you use for policy enforcement without persisting to the DAG simply doesn't exist. All commands in the embedded version are persisted to the graph.
-
-The demo policies are also trivially simple (set LED color, send chat messages) and lack the role-based access control, label management, and channel creation logic present in the full version's policy. That said, the policy engine *could* run a more complex policy — the limitation is in the surrounding infrastructure (no real crypto envelope, no role management in the daemon code), not the VM itself.
+The embedded version's manual configuration approach (`aranya-embedded-config` tool writing peer addresses to flash) aligns with your relaxed requirement. Team creation via `daemon.create_team()` works in both versions. The remaining gap is that the embedded version uses a fixed nonce and has no key material — but that's a crypto gap, not an onboarding gap.
 
 ---
 
-## 3. Feature Comparison: Other Capabilities
+## 3. Transport Agnosticism — Embedded is Better Positioned
 
-### 3.1 Cryptography
+This is a surprising finding: **Aranya Embedded is better positioned for transport-agnostic sync than the full version.**
 
-| Capability | Aranya (Full) | Aranya Embedded |
-|------------|---------------|-----------------|
-| Envelope implementation | Real AEAD encryption + signatures | `NullEnvelope` — hash only, dummy signature |
-| Key storage | Persistent file-based keystore with key wrapping | In-memory `MemStore` (lost on reboot) |
-| Key generation | `aranya-keygen` tool | Hardcoded 32 zero bytes |
-| Identity keys | SHA-based device ID from public key | No real identity keys |
-| Signing keys | ECDSA/EdDSA signatures | Not implemented |
-| Encryption keys | AEAD for channel data | Not implemented |
-| TLS/PSK | Per-team PSK with rustls | Not implemented |
-| Zeroization | Keys zeroized on drop | Not implemented |
-| RNG | OS-provided | ESP32 hardware RNG |
+### 3.1 The NetworkInterface Trait (Embedded)
 
-**Gap Assessment: CRITICAL**
+The embedded version defines a clean, minimal trait:
 
-This is the **single largest gap**. The embedded version has **no real cryptography**. Commands are "sealed" with a SHA256 hash and a literal `b"LOL"` signature. There is no encryption in transit, no peer authentication, and no key management. The code is littered with TODOs acknowledging this:
+```rust
+trait NetworkInterface {
+    type Addr: Copy + Display + Hash;
+    const BROADCAST: Self::Addr;
 
-- `"TODO(chip): use actual keys"`
-- `"TODO(chip): use an actual signature"`
-- `"Temporarily fix the nonce for demo purposes"`
+    async fn send_message(&mut self, msg: Message<Self::Addr>) -> Result<(), NetworkError>;
+    async fn recv_message(&mut self) -> Result<Message<Self::Addr>, NetworkError>;
+    fn my_address(&self) -> Self::Addr;
+}
 
-Given your requirement for essential cryptographic authentication and encryption, this alone makes the embedded version unsuitable as a drop-in replacement.
+struct Message<A> {
+    sender: A,
+    recipient: A,
+    contents: Box<[u8]>,
+}
+```
 
-### 3.2 Networking & Transport
+This is **transport-agnostic by design**. The sync engine (`SyncEngine<N: NetworkInterface>`) treats the network as a message-oriented abstraction. It doesn't assume broadcast, point-to-point, reliable, or unreliable delivery.
 
-| Capability | Aranya (Full) | Aranya Embedded |
-|------------|---------------|-----------------|
-| Primary transport | QUIC (s2n-quic with PSK) | IR / ESP-NOW (broadcast) |
-| TCP/IP support | Yes (QUIC over UDP/IP) | WiFi backend exists but non-functional |
-| Serial/UART | Not supported | IR transceiver over UART |
-| IPC | Unix domain sockets (tarpc) | None (direct function calls) |
-| AFC (Fast Channels) | Shared memory ring buffer | Not implemented |
-| AQC (QUIC Channels) | QUIC data streams (bidi + uni) | Not implemented |
-| Transport abstraction | Hardcoded to QUIC | `NetworkInterface` trait (abstractable) |
-| Connection model | Connection-oriented (pooled) | Connectionless (broadcast) |
+### 3.2 The Full Version's QUIC Lock-In
 
-**Gap Assessment: HIGH**
+The full version hardcodes QUIC (`s2n-quic` with PSK TLS) as the transport. There is **no transport abstraction trait** in the full version — QUIC is wired directly into the sync task. To use a different transport, you'd have to refactor the daemon's sync layer.
 
-For your mixed network environment (TCP/IP + serial/bus), neither version provides out-of-the-box support for all your transports. The full version is locked to QUIC/TCP/IP. The embedded version at least has a `NetworkInterface` trait that could be implemented for other transports (serial, CAN, etc.), but the existing implementations are IR and ESP-NOW only.
+### 3.3 Implementing Your Target Transports
 
-### 3.3 Storage
+For each transport you listed, here's what a `NetworkInterface` implementation would involve:
 
-| Capability | Aranya (Full) | Aranya Embedded |
-|------------|---------------|-----------------|
-| Storage backend | POSIX filesystem (`libc::FileManager`) | ESP32 flash partitions / SD card |
-| Provider | `LinearStorageProvider<FileManager>` | `LinearStorageProvider<EspPartitionIoManager>` |
-| Persistence | Yes (survives restarts) | Yes (flash), but keys are in-memory only |
-| Configuration | TOML config files | Binary parameter block in flash |
-| Graph storage | `{state_dir}/storage/` directory | Named "graph" partition in flash |
+| Transport | Framing Needed | Loss Tolerance | Addressing | Effort |
+|-----------|---------------|----------------|------------|--------|
+| **UDP** | Length prefix (4 bytes) | RaptorQ recommended | IP:port as Addr | Low |
+| **Pub/Sub (e.g., Zenoh)** | None (message-oriented) | None (reliable) | Topic as Addr | Low |
+| **CCSDS Cmd/Tlm** | CCSDS packet header | Depends on link | APID as Addr | Medium |
+| **MAVLink** | MAVLink v2 framing | Depends on link | System/Component ID | Medium |
+| **Serial/UART** | Magic + length + CRC | RaptorQ for noisy links | Static peer ID | Low-Medium |
 
-**Gap Assessment: LOW**
+**Key architectural insight**: RaptorQ encoding (fountain codes for loss tolerance) is part of the **network layer**, not the sync protocol. It's applied inside the `send_message()`/`recv_message()` implementations. For reliable transports (TCP, pub/sub, reliable serial), you skip RaptorQ entirely. For lossy links (UDP broadcast, radio, CCSDS over RF), you add it.
 
-Both use the same `LinearStorageProvider` from `aranya-runtime` — just with different I/O backends. The storage layer is actually well-abstracted and is one of the most portable parts of the system.
+### 3.4 What the Sync Protocol Assumes About the Transport
 
-### 3.4 API & Integration Surface
+The sync protocol needs:
+- Complete message delivery (no partial messages) — transport must handle framing/reassembly
+- Sender/recipient identity preserved
+- Bidirectional communication (request triggers response)
 
-| Capability | Aranya (Full) | Aranya Embedded |
-|------------|---------------|-----------------|
-| Rust client library | `aranya-client` crate | Direct `Daemon` struct calls |
-| C API | `aranya-client-capi` (cbindgen) | None |
-| RPC interface | tarpc-based `DaemonApi` trait | None |
-| Effect handling | `EffectHandler` with async processing | `Sink` trait (synchronous consume) |
-| Metrics | Prometheus/Datadog/TCP export | None |
-| Logging | tracing + tracing-subscriber | `defmt` / `log` (embedded logging) |
-
-**Gap Assessment: HIGH**
-
-The full version provides a well-defined client library, a C FFI for non-Rust integrations, and a formal RPC API. The embedded version has none of these — your application code must directly call into the `Daemon` struct. If your flight software has components in C/C++ or other languages, the embedded version offers no integration path today.
+The sync protocol does NOT assume:
+- Ordering (handles out-of-order messages)
+- Guaranteed delivery (handles lost messages via periodic Hello + retry)
+- Encryption (currently no crypto in embedded; would need it)
 
 ---
 
-## 4. What Aranya Embedded Does Well
+## 4. Remaining Blockers
 
-Despite the gaps, the embedded version demonstrates some valuable properties:
+### 4.1 BLOCKER: Cryptographic Envelope (NullEnvelope → Real Crypto)
 
-1. **Core sync protocol is portable**: The `aranya-runtime` sync algorithm (CRDT, `SyncRequester`/`SyncResponder`) works identically in both versions. The graph merge logic is sound and transport-agnostic.
+**This is the single largest gap.** The embedded version's `NullEnvelope`:
+- Produces a SHA256 hash as the command ID
+- Signs with the literal string `b"LOL"`
+- Does not encrypt the payload
+- Does not validate anything on `open()`
 
-2. **Policy VM runs in no_std**: The policy compiler and VM work in constrained environments. Build-time compilation to rkyv binary blobs is an efficient approach.
+The full version uses HPKE (Hybrid Public Key Encryption) with:
+- AES-GCM AEAD encryption of command payloads
+- Ed25519/ECDSA signatures for authentication
+- Sequence-number-based authenticated data (RFC 9180)
+- Per-peer encryption contexts (SealCtx/OpenCtx)
+- Persistent keystore with key wrapping and zeroization
 
-3. **Transport abstraction exists**: The `NetworkInterface` trait is a clean abstraction that could be implemented for TCP, serial, CAN, or any other transport.
+**Can it be closed?** Yes. The core crypto primitives in `aranya-crypto` and `spideroak-crypto` **are `no_std`-compatible**:
 
-4. **Small footprint**: Runs in 96 KB heap + PSRAM on an ESP32-S3 at 240 MHz. The release profile optimizes for size (`opt-level = "z"`, LTO, strip).
+| Primitive | Crate | `no_std`? |
+|-----------|-------|-----------|
+| AES-GCM (AEAD) | `aes-gcm` | Yes |
+| Ed25519 (signing) | `ed25519-dalek` | Yes |
+| HPKE (key encapsulation) | `spideroak-crypto` | Yes |
+| SHA-2/SHA-3 (hashing) | `sha2`/`sha3-utils` | Yes |
+| Zeroization | `zeroize` | Yes |
+| Random | `getrandom` (ESP32 HW RNG) | Yes |
 
-5. **Loss-tolerant sync**: RaptorQ fountain codes make the sync protocol robust over unreliable links — useful for radio, IR, or noisy serial buses.
+**What's NOT `no_std`:**
+- `fs-keystore` (file-based keystore — depends on `std::fs`)
+- `tls` feature (rustls — depends on `std`)
+- `rustix` (POSIX syscalls — not needed for core crypto)
+
+**Effort estimate to implement real envelope on embedded:**
+
+| Component | Lines of Code | Effort |
+|-----------|--------------|--------|
+| Real `seal()` with AEAD encryption + Ed25519 signing | ~150 LOC | Low |
+| Real `open()` with verification + decryption | ~120 LOC | Low |
+| Persistent keystore for ESP32 NVS/flash | ~300 LOC | Medium |
+| Key generation and exchange at config time | ~200 LOC | Medium |
+| Integration with existing `Daemon` struct | ~200 LOC | Medium |
+| **Total** | **~1000 LOC** | **Medium** |
+
+The `aranya-crypto` crate can be used with features `["alloc", "clone-aead"]` (dropping `std`, `fs-keystore`, `tls`) to get the core crypto on embedded.
+
+### 4.2 BLOCKER: Interoperability Between Full and Embedded
+
+If you want full Aranya nodes and embedded nodes to sync with each other, three sub-gaps must be closed:
+
+#### 4.2.1 aranya-runtime Version Mismatch
+
+| | Full Aranya | Aranya Embedded |
+|--|-------------|-----------------|
+| `aranya-runtime` | **0.14.0** (crates.io) | **0.16.1** (git main) |
+| `aranya-crypto` | **0.10.0** | **0.12.0** (git) |
+| `postcard` | 1.1.3 | 1.1.1 |
+
+The `SyncRequester`/`SyncResponder` types, `SyncType` enum, and `SyncRequestMessage` struct may have changed between 0.14.0 and 0.16.1. **Wire format compatibility is unknown** without testing or reviewing the runtime changelog.
+
+**Fix**: Either pin both to the same `aranya-runtime` version, or verify wire compatibility between versions.
+
+#### 4.2.2 Sync Message Wrapping Differs
+
+The two versions wrap sync messages differently:
+
+- **Full version**: Sends bare `SyncType::Poll { request, address }` as postcard bytes over QUIC stream
+- **Embedded version**: Wraps in `SyncMessage { t: SyncMessageType, bytes }` enum, then serializes
+
+For interop, either:
+- Add the `SyncMessage` wrapper to the full version's transport, or
+- Have the embedded version send bare `SyncType` (removing wrapper), or
+- Implement a translation layer in a shared transport backend
+
+**Fix**: Align on a common wire format. Since both use postcard serialization for the inner `SyncType`, the actual command data is compatible — only the outer framing differs.
+
+#### 4.2.3 Crypto Envelope Must Match
+
+If the full version seals commands with real AEAD + signatures, the embedded version must be able to `open()` them with the same crypto. This means:
+- Both must use the same `Envelope` implementation (or compatible ones)
+- Key material must be shared/exchanged at configuration time
+- The `CipherSuite` selection must match
+
+**Fix**: Once the embedded version has a real envelope (gap 4.1), use the same key material and cipher suite on both sides.
 
 ---
 
-## 5. Gap Summary for Your Use Case
+## 5. Revised Gap Summary
 
-Given your requirements (replace full version, essential crypto, mixed Linux+MCU environment, multiple network types), here is the gap analysis ranked by severity:
-
-| Gap | Severity | Effort to Close |
-|-----|----------|-----------------|
-| No real cryptography (NullEnvelope) | **BLOCKING** | High — requires implementing a real envelope with signing, encryption, and key management for no_std |
-| No ephemeral sessions | **BLOCKING** | Medium — the runtime supports it; needs daemon-level API |
-| No onboarding / member addition | **BLOCKING** | High — requires role management, key exchange, and policy enforcement |
-| No TCP/IP transport | **HIGH** | Medium — `NetworkInterface` trait exists; needs TCP/UDP implementation |
-| No C API or RPC interface | **HIGH** | Medium-High — needs IPC design for embedded context |
-| No role-based access control in daemon | **HIGH** | Medium — policy VM supports it; daemon code needs role tracking |
-| No AFC/AQC channels | **MODERATE** | High — fundamentally different transport model |
-| No label management | **MODERATE** | Low-Medium — policy supports it; needs daemon wiring |
-| No key persistence | **MODERATE** | Medium — needs persistent keystore for flash/filesystem |
-| No metrics/observability | **LOW** | Low — nice to have, not blocking |
+| Gap | Severity | Effort | Notes |
+|-----|----------|--------|-------|
+| NullEnvelope → real crypto envelope | **BLOCKER** | ~1000 LOC, medium | Core crypto is `no_std`-ready; needs implementation + keystore |
+| `aranya-runtime` version alignment | **BLOCKER for interop** | Low (dependency pin) | May require testing both versions for wire compat |
+| Sync message framing alignment | **BLOCKER for interop** | Low (~50 LOC) | Agree on common wire format |
+| Persistent keystore for embedded | **HIGH** | ~300 LOC | Needed for real crypto; ESP32 NVS or flash-backed |
+| Custom `NetworkInterface` implementations | **MEDIUM** | ~200 LOC each | For UDP, pub/sub, CCSDS, MAVLink, serial |
+| C API (optional) | **LOW** | Medium-High | Not blocking if Rust integration is acceptable |
+| Direct data channels (optional) | **LOW** | High | AFC/AQC not in embedded; punt unless needed |
 
 ---
 
-## 6. Recommendation
+## 6. Revised Recommendation
 
-**Aranya Embedded is not viable as a replacement for the full Aranya version** for your use case. The three features you rely on — onboarding, state sync (with authentication), and ephemeral commands — all have critical gaps in the embedded version:
+With relaxed requirements, **Aranya Embedded is a viable foundation** — but only after closing the crypto envelope gap. Here is the minimal path:
 
-- **Onboarding**: No dynamic member addition, no role management, no key exchange.
-- **State sync**: Core algorithm works, but no transport encryption and no TCP/IP backend.
-- **Ephemeral commands**: Not implemented at all.
+### Phase 1: Crypto Envelope (Unblocks Auth/Authz)
+1. Implement a real `Envelope` FFI module using `aranya-crypto` with `no_std` features
+2. Replace `NullEnvelope` with AEAD encryption + Ed25519 signing
+3. Implement a flash-backed keystore (replacing `MemStore`)
+4. Generate and distribute key material at configuration/provisioning time
 
-### If you still want a lighter-weight solution, consider these paths:
+### Phase 2: Version Alignment (Unblocks Interop)
+1. Pin both codebases to the same `aranya-runtime` version
+2. Align sync message framing (common wire format)
+3. Test cross-version sync with real commands
 
-1. **Stick with the full version** on your Linux nodes, and use Aranya Embedded (with development investment) only for the most constrained MCU nodes that need to participate in sync. This hybrid approach plays to each version's strengths.
+### Phase 3: Transport Implementations (Unblocks Your Networks)
+1. Implement `NetworkInterface` for each target transport
+2. For reliable transports (pub/sub, TCP): simple length-prefix framing, no RaptorQ
+3. For lossy transports (UDP broadcast, CCSDS over RF): add RaptorQ encoding
+4. For CCSDS/MAVLink: map APID or system/component IDs to the `Addr` type
 
-2. **Invest in closing the crypto gap** in Aranya Embedded. The `aranya-crypto` crate already has some no_std-compatible components. Implementing a real `Envelope` (replacing `NullEnvelope`) and persistent keystore would be the highest-impact improvement.
-
-3. **Fork the full version for size optimization** rather than trying to build up from the embedded version. The full version's release profile already optimizes for size (`opt-level = "z"`, LTO, strip). A stripped-down daemon without AFC/AQC/metrics might run on a resource-constrained Linux system.
+### Phase 4 (Optional): API & Channels
+1. C API via cbindgen if non-Rust integration is needed
+2. Direct data channels if application-layer protected exchange is needed
 
 ---
 
-## Appendix: Shared Dependencies (Same Crate, Both Versions)
+## 7. Architecture: Hybrid Deployment
 
-These crates from the Aranya ecosystem are used by **both** versions, confirming protocol compatibility at the algorithm level:
+For a mixed environment where some nodes run full Aranya and others run embedded:
 
-| Crate | Full Version | Embedded Version | Role |
-|-------|-------------|-----------------|------|
-| `aranya-runtime` | 0.14.0 | git dep | DAG/graph state, sync protocol, storage providers |
-| `aranya-crypto` | 0.10.0 | git dep | Crypto primitives, keystore interface |
+```
+┌──────────────────────┐     ┌──────────────────────┐
+│   Linux Node (Full)  │     │  MCU Node (Embedded)  │
+│                      │     │                       │
+│  ┌────────────────┐  │     │  ┌─────────────────┐  │
+│  │ Aranya Daemon  │  │     │  │ Aranya Embedded  │  │
+│  │  (aranya-      │  │     │  │  (monolithic)    │  │
+│  │   runtime      │  │     │  │                  │  │
+│  │   0.16.x)      │  │     │  │  aranya-runtime  │  │
+│  │                │  │     │  │  0.16.x          │  │
+│  │  Real Envelope │  │     │  │  Real Envelope   │  │
+│  └───────┬────────┘  │     │  └───────┬──────────┘ │
+│          │           │     │          │             │
+│  ┌───────┴────────┐  │     │  ┌───────┴──────────┐  │
+│  │ NetworkIface   │  │     │  │ NetworkIface     │  │
+│  │ (UDP/Zenoh/    │  │     │  │ (UDP/CCSDS/      │  │
+│  │  CCSDS)        │  │     │  │  MAVLink/Serial) │  │
+│  └───────┬────────┘  │     │  └───────┬──────────┘  │
+│          │           │     │          │             │
+└──────────┼───────────┘     └──────────┼─────────────┘
+           │                            │
+           └──────── Shared ────────────┘
+                    Transport
+              (common wire format)
+```
+
+Key requirements for this to work:
+1. **Same `aranya-runtime` version** on both sides
+2. **Same or compatible `Envelope`** implementation (same cipher suite, same key material)
+3. **Same sync message wire format** (agree on framing)
+4. **Shared `NetworkInterface` wire protocol** for at least one common transport
+
+The full version would need to adopt the `NetworkInterface` trait (or a compatible abstraction) to move beyond QUIC-only. Alternatively, a bridge/gateway node could translate between QUIC (full) and the custom protocol (embedded).
+
+---
+
+## Appendix A: Shared Crates (Protocol Compatibility)
+
+| Crate | Full | Embedded | Role |
+|-------|------|----------|------|
+| `aranya-runtime` | 0.14.0 | 0.16.1 (git) | Sync algorithm, storage, DAG |
+| `aranya-crypto` | 0.10.0 | 0.12.0 (git) | Crypto primitives, keystore trait |
 | `aranya-policy-vm` | 0.13.0 | git dep | Policy bytecode execution |
-| `aranya-policy-compiler` | 0.13.0 | build dep | Policy DSL compilation |
-| `postcard` | 1.x | 1.0.10 | Binary serialization |
+| `aranya-policy-compiler` | 0.13.0 | build dep | Policy DSL → bytecode |
+| `postcard` | 1.1.3 | 1.1.1 | Binary serialization |
+
+## Appendix B: NetworkInterface Trait (Full Source)
+
+Location: `/home/user/aranya-embedded/crates/chat-app/src/net.rs`
+
+```rust
+pub(crate) trait NetworkInterface {
+    type Addr: Copy + core::fmt::Display + core::hash::Hash;
+    const BROADCAST: Self::Addr;
+
+    async fn send_message(&mut self, msg: Message<Self::Addr>) -> Result<(), NetworkError>;
+    async fn recv_message(&mut self) -> Result<Message<Self::Addr>, NetworkError>;
+    fn my_address(&self) -> Self::Addr;
+}
+
+pub struct Message<A> {
+    pub sender: A,
+    pub recipient: A,
+    pub contents: Box<[u8]>,
+}
+```
+
+## Appendix C: NullEnvelope (What Must Be Replaced)
+
+Location: `/home/user/aranya-embedded/crates/envelope-ffi/src/lib.rs`
+
+The FFI schema defines:
+```
+struct Envelope {
+    parent_id id,
+    author_id id,
+    command_id id,
+    payload bytes,
+    signature bytes,
+}
+```
+
+Current `seal()`: SHA256(parent_id || author_id || payload) → command_id, signature = `b"LOL"`, payload = plaintext.
+
+Target `seal()`: AEAD encrypt payload, Ed25519 sign (parent_id || author_id || ciphertext), derive command_id from signature.
+
+Current `open()`: Returns payload unconditionally (Infallible error type).
+
+Target `open()`: Verify signature, AEAD decrypt payload, return plaintext or error.
